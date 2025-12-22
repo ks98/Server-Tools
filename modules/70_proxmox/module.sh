@@ -28,6 +28,7 @@ proxmox_get_pve_major() {
 
 proxmox_map_codename() {
   case "$1" in
+    9) printf '%s' "trixie" ;;
     8) printf '%s' "bookworm" ;;
     7) printf '%s' "bullseye" ;;
     6) printf '%s' "buster" ;;
@@ -35,6 +36,86 @@ proxmox_map_codename() {
     4) printf '%s' "jessie" ;;
     *) printf '%s' "" ;;
   esac
+}
+
+proxmox_list_apt_files() {
+  local files=()
+  if [[ -f /etc/apt/sources.list ]]; then
+    files+=("/etc/apt/sources.list")
+  fi
+
+  local f
+  for f in /etc/apt/sources.list.d/*.list; do
+    [[ -e "$f" ]] || continue
+    files+=("$f")
+  done
+
+  printf '%s\n' "${files[@]}"
+}
+
+proxmox_disable_enterprise_repos() {
+  local file
+  while IFS= read -r file; do
+    if grep -qE '^[[:space:]]*(deb|deb-src)[[:space:]].*enterprise\.proxmox\.com' "$file"; then
+      sed -i -E 's|^([[:space:]]*(deb|deb-src)[[:space:]].*enterprise\.proxmox\.com.*)|# \1|' "$file"
+      log "Disabled enterprise repo in $file"
+    fi
+  done < <(proxmox_list_apt_files)
+}
+
+proxmox_collect_ceph_nosub_lines() {
+  local file line url dist repo
+  local -A seen=()
+
+  while IFS= read -r file; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(trim "$line")"
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == \#* ]]; then
+        line="${line#\#}"
+        line="$(trim "$line")"
+      fi
+      case "$line" in
+        deb\ *|deb-src\ *) ;;
+        *) continue ;;
+      esac
+
+      url="$(awk '{for (i=2;i<=NF;i++) if ($i ~ /^https?:\\/\\//) {print $i; exit}}' <<< "$line")"
+      dist="$(awk '{for (i=2;i<=NF;i++) if ($i ~ /^https?:\\/\\//) {print $(i+1); exit}}' <<< "$line")"
+      if [[ "$url" == *"enterprise.proxmox.com/debian/ceph-"* ]]; then
+        repo="${url##*/}"
+        if [[ -n "$repo" && -n "$dist" ]]; then
+          local nosub_line
+          nosub_line="deb http://download.proxmox.com/debian/$repo $dist no-subscription"
+          if [[ -z "${seen[$nosub_line]:-}" ]]; then
+            seen["$nosub_line"]=1
+            printf '%s\n' "$nosub_line"
+          fi
+        fi
+      fi
+    done < "$file"
+  done < <(proxmox_list_apt_files)
+}
+
+proxmox_write_ceph_nosub_file() {
+  local -a lines=("$@")
+  local file="/etc/apt/sources.list.d/ceph-no-subscription.list"
+
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "# Managed by Server-Tools" > "$tmp"
+  local line
+  for line in "${lines[@]}"; do
+    printf '%s\n' "$line" >> "$tmp"
+  done
+
+  install -m 0644 "$tmp" "$file"
+  rm -f "$tmp"
+  log "Wrote no-subscription repo to $file"
 }
 
 module_proxmox_repos_check() {
@@ -72,26 +153,20 @@ module_proxmox_repos_run() {
     warn "OS codename ($os_codename) differs from PVE mapping ($target_codename). Using $target_codename."
   fi
 
-  local enterprise_file="/etc/apt/sources.list.d/pve-enterprise.list"
-  if [[ -f "$enterprise_file" ]]; then
-    if grep -qE '^[[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com/debian/pve' "$enterprise_file"; then
-      sed -i -E 's|^([[:space:]]*deb[[:space:]].*enterprise\.proxmox\.com/debian/pve.*)|# \1|' "$enterprise_file"
-      log "Disabled enterprise repo in $enterprise_file"
-    fi
-  fi
+  proxmox_disable_enterprise_repos
 
   local nosub_file="/etc/apt/sources.list.d/pve-no-subscription.list"
   local nosub_line="deb http://download.proxmox.com/debian/pve $target_codename pve-no-subscription"
 
-  if [[ -f "$nosub_file" ]] && grep -qF "$nosub_line" "$nosub_file"; then
-    log "No-subscription repo already configured in $nosub_file"
-  else
-    cat <<EOF_NOSUB > "$nosub_file"
+  cat <<EOF_NOSUB > "$nosub_file"
 # Managed by Server-Tools
 $nosub_line
 EOF_NOSUB
-    log "Wrote no-subscription repo to $nosub_file"
-  fi
+  log "Wrote no-subscription repo to $nosub_file"
+
+  local -a ceph_lines=()
+  mapfile -t ceph_lines < <(proxmox_collect_ceph_nosub_lines)
+  proxmox_write_ceph_nosub_file "${ceph_lines[@]}"
 }
 
 register_module "proxmox-repos" "Proxmox Repos" "Switch enterprise to no-subscription" "module_proxmox_repos_run" "module_proxmox_repos_check" "true"
