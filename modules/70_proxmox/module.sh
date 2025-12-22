@@ -80,8 +80,18 @@ proxmox_collect_ceph_nosub_lines() {
         *) continue ;;
       esac
 
-      url="$(awk '{for (i=2;i<=NF;i++) if ($i ~ /^https?:\\/\\//) {print $i; exit}}' <<< "$line")"
-      dist="$(awk '{for (i=2;i<=NF;i++) if ($i ~ /^https?:\\/\\//) {print $(i+1); exit}}' <<< "$line")"
+      url=""
+      dist=""
+      local -a parts=()
+      read -r -a parts <<< "$line"
+      local i
+      for i in "${!parts[@]}"; do
+        if [[ "${parts[$i]}" =~ ^https?:// ]]; then
+          url="${parts[$i]}"
+          dist="${parts[$((i + 1))]:-}"
+          break
+        fi
+      done
       if [[ "$url" == *"enterprise.proxmox.com/debian/ceph-"* ]]; then
         repo="${url##*/}"
         if [[ -n "$repo" && -n "$dist" ]]; then
