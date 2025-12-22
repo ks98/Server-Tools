@@ -49,13 +49,119 @@ proxmox_list_apt_files() {
     [[ -e "$f" ]] || continue
     files+=("$f")
   done
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [[ -e "$f" ]] || continue
+    files+=("$f")
+  done
 
   printf '%s\n' "${files[@]}"
+}
+
+proxmox_deb822_write_stanza_disable_enterprise() {
+  local tmp="$1"
+  shift
+  local -a stanza=("$@")
+  local has_enterprise=0
+  local has_enabled=0
+  local types_index=-1
+  local types_indent=""
+  local enabled_indent=""
+  local i line
+
+  for i in "${!stanza[@]}"; do
+    line="${stanza[$i]}"
+    if [[ "$line" =~ enterprise\.proxmox\.com ]]; then
+      has_enterprise=1
+    fi
+    if [[ "$line" =~ ^([[:space:]]*)Enabled: ]]; then
+      has_enabled=1
+      enabled_indent="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ ^([[:space:]]*)Types: ]]; then
+      types_index=$i
+      types_indent="${BASH_REMATCH[1]}"
+    fi
+  done
+
+  if [[ $has_enterprise -eq 0 ]]; then
+    printf '%s\n' "${stanza[@]}" >> "$tmp"
+    return 0
+  fi
+
+  PROXMOX_DEB822_FOUND=1
+
+  local -a out=()
+  if [[ $has_enabled -eq 1 ]]; then
+    for line in "${stanza[@]}"; do
+      if [[ "$line" =~ ^[[:space:]]*Enabled: ]]; then
+        out+=("${enabled_indent}Enabled: no")
+      else
+        out+=("$line")
+      fi
+    done
+  else
+    if [[ $types_index -ge 0 ]]; then
+      for i in "${!stanza[@]}"; do
+        out+=("${stanza[$i]}")
+        if [[ $i -eq $types_index ]]; then
+          out+=("${types_indent}Enabled: no")
+        fi
+      done
+    else
+      out+=("Enabled: no")
+      out+=("${stanza[@]}")
+    fi
+  fi
+
+  printf '%s\n' "${out[@]}" >> "$tmp"
+}
+
+proxmox_disable_enterprise_deb822_file() {
+  local file="$1"
+
+  if ! grep -q "enterprise.proxmox.com" "$file"; then
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  local -a stanza=()
+  local line trimmed
+  PROXMOX_DEB822_FOUND=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim "$line")"
+    if [[ -z "$trimmed" ]]; then
+      if [[ ${#stanza[@]} -gt 0 ]]; then
+        proxmox_deb822_write_stanza_disable_enterprise "$tmp" "${stanza[@]}"
+        stanza=()
+      fi
+      printf '\n' >> "$tmp"
+      continue
+    fi
+    stanza+=("$line")
+  done < "$file"
+
+  if [[ ${#stanza[@]} -gt 0 ]]; then
+    proxmox_deb822_write_stanza_disable_enterprise "$tmp" "${stanza[@]}"
+  fi
+
+  if [[ $PROXMOX_DEB822_FOUND -eq 1 ]]; then
+    if ! cmp -s "$tmp" "$file"; then
+      install -m 0644 "$tmp" "$file"
+      log "Disabled enterprise repo in $file"
+    fi
+  fi
+  rm -f "$tmp"
 }
 
 proxmox_disable_enterprise_repos() {
   local file
   while IFS= read -r file; do
+    if [[ "$file" == *.sources ]]; then
+      proxmox_disable_enterprise_deb822_file "$file"
+      continue
+    fi
     if grep -qE '^[[:space:]]*(deb|deb-src)[[:space:]].*enterprise\.proxmox\.com' "$file"; then
       sed -i -E 's|^([[:space:]]*(deb|deb-src)[[:space:]].*enterprise\.proxmox\.com.*)|# \1|' "$file"
       log "Disabled enterprise repo in $file"
@@ -63,11 +169,80 @@ proxmox_disable_enterprise_repos() {
   done < <(proxmox_list_apt_files)
 }
 
+proxmox_collect_ceph_from_deb822_stanza() {
+  local -a stanza=("$@")
+  local -a uris=()
+  local -a suites=()
+  local line trimmed rest
+
+  for line in "${stanza[@]}"; do
+    trimmed="$(trim "$line")"
+    case "$trimmed" in
+      URIs:*)
+        rest="${trimmed#URIs:}"
+        rest="$(trim "$rest")"
+        read -r -a uris <<< "$rest"
+        ;;
+      Suites:*)
+        rest="${trimmed#Suites:}"
+        rest="$(trim "$rest")"
+        read -r -a suites <<< "$rest"
+        ;;
+    esac
+  done
+
+  if [[ ${#uris[@]} -eq 0 || ${#suites[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local uri suite repo
+  for uri in "${uris[@]}"; do
+    if [[ "$uri" == *"enterprise.proxmox.com/debian/ceph-"* ]]; then
+      repo="${uri##*/}"
+      for suite in "${suites[@]}"; do
+        printf '%s\n' "deb http://download.proxmox.com/debian/$repo $suite no-subscription"
+      done
+    fi
+  done
+}
+
+proxmox_collect_ceph_from_deb822() {
+  local file="$1"
+  local line trimmed
+  local -a stanza=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="$(trim "$line")"
+    if [[ -z "$trimmed" ]]; then
+      if [[ ${#stanza[@]} -gt 0 ]]; then
+        proxmox_collect_ceph_from_deb822_stanza "${stanza[@]}"
+        stanza=()
+      fi
+      continue
+    fi
+    stanza+=("$line")
+  done < "$file"
+
+  if [[ ${#stanza[@]} -gt 0 ]]; then
+    proxmox_collect_ceph_from_deb822_stanza "${stanza[@]}"
+  fi
+}
+
 proxmox_collect_ceph_nosub_lines() {
   local file line url dist repo
   local -A seen=()
 
   while IFS= read -r file; do
+    if [[ "$file" == *.sources ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        if [[ -z "${seen[$line]:-}" ]]; then
+          seen["$line"]=1
+          printf '%s\n' "$line"
+        fi
+      done < <(proxmox_collect_ceph_from_deb822 "$file")
+      continue
+    fi
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="$(trim "$line")"
       [[ -z "$line" ]] && continue
