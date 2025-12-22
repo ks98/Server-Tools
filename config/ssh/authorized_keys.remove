@@ -1,0 +1,2 @@
+# One public key per line to remove from root authorized_keys.
+# Lines starting with # are ignored.

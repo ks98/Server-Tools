@@ -1,0 +1,10 @@
+# Ordered module directories
+00_base
+05_updates
+10_shell
+20_tools
+30_security
+40_ssh
+50_monitoring
+60_mail
+70_proxmox

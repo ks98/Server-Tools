@@ -1,0 +1,2 @@
+# One public key per line to ensure it exists for root.
+# Lines starting with # are ignored.

@@ -16,7 +16,7 @@ Lokal:
 
 Remote (Argumente nach `--`):
 ```
-bash -c "$(wget -O - https://example.com/your/run.sh)" -- --menu
+bash -c "$(wget -O - https://raw.githubusercontent.com/ks98/Server-Tools/main/run.sh)" -- --menu
 ```
 
 Nicht-interaktiv:
