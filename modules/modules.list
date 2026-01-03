@@ -1,5 +1,8 @@
 # Ordered module directories
 00_base
+01_time
+02_locale
+03_hostname
 05_updates
 10_shell
 20_tools
