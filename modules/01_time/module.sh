@@ -20,6 +20,48 @@ time_prompt_default() {
   printf '%s' "$value"
 }
 
+time_is_pkg_installed() {
+  local pkg="$1"
+
+  if command -v dpkg-query >/dev/null 2>&1; then
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+time_has_chrony() {
+  time_is_pkg_installed "chrony" || command -v chronyd >/dev/null 2>&1 || command -v chronyc >/dev/null 2>&1
+}
+
+time_has_ntp() {
+  time_is_pkg_installed "ntp" || command -v ntpd >/dev/null 2>&1 || command -v ntpdate >/dev/null 2>&1
+}
+
+module_time_check() {
+  local -a found=()
+
+  if time_has_chrony; then
+    found+=("chrony")
+  fi
+  if time_has_ntp; then
+    found+=("ntp")
+  fi
+
+  if [[ ${#found[@]} -gt 0 ]]; then
+    if [[ ${#found[@]} -eq 1 ]]; then
+      warn "${found[0]} is installed; skipping time module."
+    else
+      warn "${found[0]} and ${found[1]} are installed; skipping time module."
+    fi
+    return 1
+  fi
+
+  return 0
+}
+
 module_time_run() {
   require_root
 
@@ -75,4 +117,4 @@ CONF
   fi
 }
 
-register_module "time" "Time" "Timezone and NTP settings" "module_time_run" "" "true"
+register_module "time" "Time" "Timezone and NTP settings" "module_time_run" "module_time_check" "true"
